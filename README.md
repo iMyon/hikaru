@@ -4,6 +4,8 @@
     <blockquote align="center">此时此刻，你也一定，光辉耀目<br> / 君は私の光〜</blockquote>
 </p>
 
+Forked from [wacky6/hikaru](https://github.com/wacky6/hikaru) ，自用修改版，for NAS
+
 * [Docker 用法](#docker-用法)
 * [直播监听 / 录屏](#直播监听---daemon)
   * [开播通知](#telegram-开播通知)
@@ -34,7 +36,7 @@ hikaru daemon <room_id>   # 房间号（短号、长号均可）
 ```
 
 捕捉直播视频，默认保存到 `~/hikaru/` ，文件名：`<up昵称>__<日期>_<捕捉开始时间>.flv`。\
-时区为 中国标准时间 (CST / UTC+8)。
+时区为 中国标准时间 (CST / UTC+8)，同时会保存ass格式字幕文件。
 
 * `-C` / `--no-capture`：配合 Telegram 通知使用。只发通知，不录制。 ~~（那个 up 不够重要）~~
 * `-f` / `--format`：指定录播文件格式，支持： `mp4` / `mkv`。

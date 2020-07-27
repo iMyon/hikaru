@@ -8,13 +8,15 @@ const { parseRoom } = require('../lib/parser')
 const { getRoomInfo, getRoomUser, getPlayUrls } = require('../lib/bili-api')
 const { spawn } = require('child_process')
 const { createWriteStream, getFileSize, getOutputPath } = require('../lib/fs')
-const { unlink } = require('fs')
+const { unlink, renameSync } = require('fs')
 const dateformat = require('dateformat')
 const { resolve: resolveUrl } = require('url')
 const { sendMessage, editMessageText } = require('../lib/telegram-api')
 const { parseArgsStringToArgv } = require('string-argv')
 const { PassThrough } = require('stream')
 const { resolve: pathResolve } = require('path')
+const { HighAvailabilityDanmakuStream } = require('../lib/danmaku')
+const DanmakuConverter = require('../lib/danmaku-converter')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -27,6 +29,49 @@ const LIVE_STATUS_CHECK_INTERVAL = 60 * 1000
 
 const NODE_EXEC = process.execPath
 const HIKARU_EXEC = pathResolve(__dirname, '../bin/hikaru')
+
+if (process.env['PREVENT_CTRL_C']) {
+    // 调试用: prevent ctrl-c
+    process.on('SIGINT', async () => {});
+}
+
+function spawnFfmpeg(format) {
+    const formatMap = {
+        mkv: 'matroska'
+    }
+    // 使用fragment形式存储，并将moov移动到文件开头
+    const args = ['-i', 'pipe:0', '-c', 'copy', '-movflags', 'faststart+empty_moov', '-f', formatMap[format] || format, 'pipe:1']
+    const ffmpeg = spawn('ffmpeg', args);
+    ffmpeg.on('exit', () => {
+        console.log('ffmpeg exit')
+    });
+    ffmpeg.stderr.on('data', function (data) {
+        // console.log('ffmpeg stderr: ' + data);
+    });
+    return ffmpeg;
+}
+
+function moveMoovToBegin (outputPath) {
+    console.log('😈 正在修正视频时间头信息')
+    const tmpFile = outputPath.replace(/^(.*)(\.[^\.]+)$/, '$1.tmp$2');
+    // 使用fragment形式存储，并将moov移动到文件开头
+    const args = ['-i',  outputPath, '-c', 'copy', '-movflags', 'faststart', tmpFile]
+    const ffmpeg = spawn('ffmpeg', args);
+    ffmpeg.on('exit', () => {
+        console.log('ffmpeg(moov) exit')
+    });
+    return new Promise(resolve => ffmpeg.once('close', (code) => {
+        unlink(outputPath, (err) => {
+            console.log(err || `😈 已删除文件 ${outputPath}`)
+            if (!err) {
+                console.log(`正在重命名临时文件 ${tmpFile}`);
+                renameSync(tmpFile, outputPath);
+                console.log(`重命名文件成功 ${outputPath}`);
+            }
+        })
+        resolve(code === 0)
+    }))
+}
 
 async function getFlvStream(url, referer) {
     const args = [
@@ -151,12 +196,29 @@ async function captureStream(outputPath, canonicalRoomId, extractOpts = false) {
     console.error('')
 
     const outputStream = outputPath === '-' ? process.stdout : createWriteStream(outputPath)
+
+    const dmkConverter = new DanmakuConverter({output: outputPath.replace(/\.[^\.]+$/, ".ass")})
+    let dmk = new HighAvailabilityDanmakuStream(canonicalRoomId)
+    dmk.connect();
+    dmk.on('danmaku', (danmakuStr, meta) => {
+        const danmaku = JSON.parse(danmakuStr)
+        if (danmaku.cmd === 'DANMU_MSG') {
+            dmkConverter.push(danmaku)
+        }
+    })
+
+    dmk.on('activeClose', () => {
+        dmkConverter.close();
+    })
+
     const refererUrl = `https://live.bilibili.com/${canonicalRoomId}`
     const flvStream = await getFlvStream(urls[0].url, refererUrl)
+    const ffmpeg = spawnFfmpeg(outputPath.match(/\.([^\.]+)$/)[1]);
 
     const passToOutput = new PassThrough()
     passToOutput.pipe(outputStream)
-    flvStream.pipe(passToOutput)
+    flvStream.pipe(ffmpeg.stdin)
+    ffmpeg.stdout.pipe(passToOutput)
 
     let promiseFlvStreamFinish = new Promise(resolve => outputStream.once('close', _ => resolve(true)))
     let promiseExtractionFinish = null
@@ -185,10 +247,14 @@ async function captureStream(outputPath, canonicalRoomId, extractOpts = false) {
 
     await promiseFlvStreamFinish
 
+    dmk.close();
+
     // nuke blank stream
     const fileSize = await getFileSize(outputPath)
     if (fileSize < BLANK_STREAM_FILE_SIZE_THRESHOLD) {
         unlink(outputPath, err => err || console.error(`😈  删除空的视频流：${outputPath}`))
+        const assFilePath = outputPath.replace(/\.[^\.]+$/, ".ass");
+        unlink(assFilePath, err => err || console.error(`😈  删除空的视频流弹幕：${assFilePath}`))
     }
 
     if (fileSize && extractOpts && !extractOpts.realtime) {
@@ -276,12 +342,13 @@ module.exports = {
             telegramEndpoint,
             telegram = null,
             silent = false,
-            noCapture = false,
             format = 'flv',
             extract = false,
             extractArgs = '',
             realtimeAnalyze = false,
         } = argv
+
+        let { noCapture = false } = argv;
 
         const telegramOpts = { telegramEndpoint, telegram, silent }
 
@@ -328,7 +395,7 @@ module.exports = {
                 } else {
                     // capture stream
                     const flvTime = dateformat(new Date(), 'yyyy-mm-dd_HHMMss')
-                    const flvPath = getOutputPath(output, outputDir, { idol: name, ext: 'flv', time: flvTime })
+                    const outputPath = getOutputPath(output, outputDir, { idol: name, ext: format, time: flvTime, title })
                     const extractOpts = extract ? {
                         type: extract,
                         realtime: realtimeAnalyze,
@@ -337,15 +404,13 @@ module.exports = {
 
                     const {
                         promiseExtractionFinish
-                    } = await captureStream(flvPath, canonicalRoomId, extractOpts)
-
-                    const outputPath = getOutputPath(output, outputDir, { idol: name, ext: format, time: flvTime })
+                    } = await captureStream(outputPath, canonicalRoomId, extractOpts)
 
                     // asynchronously convert container format
                     promiseExtractionFinish.then(success => {
                         if (success) {
                             console.error(`run: extraction success.`)
-                            return convertContainerFormat(flvPath, outputPath, format)
+                            return moveMoovToBegin(outputPath)
                         } else {
                             console.error(`run: extraction fails, will not convert container format`)
                         }
